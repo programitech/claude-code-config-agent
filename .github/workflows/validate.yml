@@ -1,0 +1,54 @@
+name: validate
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  validate:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install Claude Code CLI
+        run: npm install -g @anthropic-ai/claude-code
+
+      - name: Validate marketplace and plugin manifests
+        run: |
+          claude plugin validate . --strict
+          claude plugin validate plugins/cc-config --strict
+
+      - name: Check helper and scripts
+        run: |
+          python3 -m py_compile plugins/cc-config/bin/cc-config
+          for f in plugins/cc-config/skills/config-knowledge/templates/*.sh plugins/cc-config/skills/config-knowledge/templates/hooks/*.sh install.sh; do
+            bash -n "$f"
+            test -x "$f" || { echo "not executable: $f"; exit 1; }
+          done
+          python3 -m json.tool plugins/cc-config/skills/config-knowledge/templates/settings.template.json >/dev/null
+          plugins/cc-config/bin/cc-config list
+          for t in tokens memory settings hooks agents skills mcp docs; do plugins/cc-config/bin/cc-config ref "$t" >/dev/null; done
+
+      - name: Hook template smoke tests
+        run: |
+          H=plugins/cc-config/skills/config-knowledge/templates/hooks
+          echo '{"tool_input":{"file_path":"/p/.env"}}' | CLAUDE_PROJECT_DIR=/p "$H/protect-files.sh" && exit 1 || test $? -eq 2
+          echo '{"tool_input":{"file_path":"/p/src/a.ts"}}' | CLAUDE_PROJECT_DIR=/p "$H/protect-files.sh"
+          echo '{"tool_input":{"command":"rm -rf /"}}' | "$H/block-dangerous-bash.sh" && exit 1 || test $? -eq 2
+          echo '{"tool_input":{"command":"npm test"}}' | "$H/block-dangerous-bash.sh"
+          echo '{"tool_input":{"command":"pytest"}}' | "$H/filter-test-output.sh" | grep -q updatedInput
+          echo '{"tool_input":{"command":"ls"}}' | "$H/filter-test-output.sh" | grep -q '{}'
+
+      - name: Audit and validate a fixture project
+        run: |
+          mkdir -p /tmp/fixture/.claude/agents && cd /tmp/fixture && git init -q
+          printf '# Fixture\n\n- Run tests with `npm test`.\n' > CLAUDE.md
+          printf '{ "permissions": { "deny": ["Read(./.env)"] } }\n' > .claude/settings.json
+          printf -- '---\nname: demo\ndescription: Demo agent.\ntools: Read\n---\nDo things.\n' > .claude/agents/demo.md
+          "$GITHUB_WORKSPACE/plugins/cc-config/bin/cc-config" audit --project /tmp/fixture
+          "$GITHUB_WORKSPACE/plugins/cc-config/bin/cc-config" validate --project /tmp/fixture

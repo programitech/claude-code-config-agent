@@ -1,0 +1,17 @@
+{
+  "$schema": "https://anthropic.com/claude-code/marketplace.schema.json",
+  "name": "cc-config-agent",
+  "description": "Claude Code configuration agent for any project.",
+  "owner": {
+    "name": "ProgramiTech"
+  },
+  "plugins": [
+    {
+      "name": "cc-config",
+      "source": "./plugins/cc-config",
+      "description": "Token-efficient Claude Code configuration agent: setup, audit, optimize, and create agents, skills, hooks, memory, settings and MCP config.",
+      "category": "development",
+      "tags": ["configuration", "setup", "token-efficiency"]
+    }
+  ]
+}

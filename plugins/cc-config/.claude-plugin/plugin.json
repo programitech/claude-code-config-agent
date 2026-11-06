@@ -1,0 +1,13 @@
+{
+  "name": "cc-config",
+  "displayName": "Claude Code Config Agent",
+  "version": "1.0.0",
+  "description": "Token-efficient Claude Code configuration agent: sets up, audits and optimizes CLAUDE.md/memory, settings, permissions, auto-compact, hooks, subagents, skills and MCP using current official best practices.",
+  "author": {
+    "name": "ProgramiTech"
+  },
+  "homepage": "https://github.com/programitech/claude-code-config-agent",
+  "repository": "https://github.com/programitech/claude-code-config-agent",
+  "license": "MIT",
+  "keywords": ["claude-code", "configuration", "setup", "agents", "skills", "hooks", "memory", "token-efficiency"]
+}

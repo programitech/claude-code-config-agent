@@ -1,0 +1,786 @@
+#!/usr/bin/env python3
+"""cc-config: helper for the cc-config Claude Code plugin (on PATH via the plugin's bin/).
+
+  cc-config audit    [--project DIR] [--json]   token footprint of every always-loaded config layer + findings
+  cc-config validate [--project DIR] [--json]   structural checks of settings, hooks, agents, skills, .mcp.json
+  cc-config ref <topic>                         print a reference (topics: cc-config list)
+  cc-config template <name> [--to PATH]         print a template, or copy it to PATH (keeps exec bit)
+  cc-config list                                list references and templates
+
+Stdlib only. Token numbers are estimates (chars/4); /context gives exact numbers.
+`validate` exits 1 when errors are found.
+"""
+from __future__ import annotations
+
+import argparse
+import json
+import math
+import os
+import re
+import shutil
+import sys
+from pathlib import Path
+
+HOME = Path.home()
+KNOWLEDGE = Path(__file__).resolve().parent.parent / "skills" / "config-knowledge"
+REF_ALIASES = {"tokens": "token-efficiency", "cost": "token-efficiency", "agents": "subagents",
+               "mcp": "mcp-plugins", "plugins": "mcp-plugins", "docs": "docs-index", "permissions": "settings"}
+TEMPLATE_ALIASES = {"claude-md": "CLAUDE.template.md", "rule": "rule.md", "agent": "agent.md",
+                    "skill": "skill.md", "settings": "settings.template.json", "statusline": "statusline.sh"}
+CLAUDE_HOME = Path(os.environ.get("CLAUDE_CONFIG_DIR", HOME / ".claude"))
+MANAGED_DIR = (
+    Path("/Library/Application Support/ClaudeCode")
+    if sys.platform == "darwin"
+    else Path("/etc/claude-code")
+)
+SKIP_DIRS = {".git", "node_modules", ".venv", "venv", "dist", "build", ".next", "target",
+             "__pycache__", ".cache", "vendor", ".idea", ".vscode", "coverage"}
+
+# Thresholds used for warnings (estimated tokens unless noted).
+MEMORY_STARTUP_WARN = 3000
+MEMORY_FILE_LINES_WARN = 200
+SKILL_DESC_CHARS_WARN = 300
+SKILL_DESC_CAP = 1536
+AGENT_DESC_CHARS_WARN = 500
+LISTING_WARN = 3000
+MCP_SERVERS_WARN = 6
+SKILL_LINES_WARN = 500
+
+HOOK_EVENTS = {
+    "PreToolUse", "PostToolUse", "PostToolUseFailure", "PostToolBatch", "PermissionRequest",
+    "PermissionDenied", "UserPromptSubmit", "UserPromptExpansion", "Notification", "Stop",
+    "StopFailure", "SubagentStart", "SubagentStop", "TaskCreated", "TaskCompleted",
+    "TeammateIdle", "SessionStart", "SessionEnd", "PreCompact", "PostCompact", "Setup",
+    "InstructionsLoaded", "ConfigChange", "CwdChanged", "FileChanged", "WorktreeCreate",
+    "WorktreeRemove", "Elicitation", "ElicitationResult", "MessageDisplay", "DirectoryAdded",
+    "PreModelSwitch", "PostModelSwitch",
+}
+HOOK_TYPES = {"command", "prompt", "agent", "http", "mcp_tool"}
+AGENT_COLORS = {"red", "blue", "green", "yellow", "purple", "orange", "pink", "cyan"}
+MODEL_ALIASES = {"inherit", "sonnet", "opus", "haiku", "fable", "default", "best",
+                 "opusplan", "sonnet[1m]", "opus[1m]"}
+EFFORT_LEVELS = {"low", "medium", "high", "xhigh", "max"}
+TOKEN_ENV_VARS = [
+    "CLAUDE_AUTOCOMPACT_PCT_OVERRIDE", "DISABLE_AUTO_COMPACT", "DISABLE_COMPACT",
+    "CLAUDE_CODE_AUTO_COMPACT_WINDOW", "MAX_THINKING_TOKENS", "CLAUDE_CODE_MAX_OUTPUT_TOKENS",
+    "BASH_MAX_OUTPUT_LENGTH", "MAX_MCP_OUTPUT_TOKENS", "ENABLE_TOOL_SEARCH",
+    "CLAUDE_CODE_SUBAGENT_MODEL", "SLASH_COMMAND_TOOL_CHAR_BUDGET",
+    "CLAUDE_CODE_DISABLE_AUTO_MEMORY", "CLAUDE_CODE_DISABLE_1M_CONTEXT",
+    "CLAUDE_CODE_FILE_READ_MAX_OUTPUT_TOKENS", "CLAUDE_CODE_EFFORT_LEVEL",
+]
+
+
+def est(text: str) -> int:
+    return math.ceil(len(text) / 4) if text else 0
+
+
+def read(path: Path) -> str:
+    try:
+        return path.read_text(encoding="utf-8", errors="replace")
+    except OSError:
+        return ""
+
+
+def load_json(path: Path, errors: list | None = None):
+    if not path.is_file():
+        return None
+    try:
+        return json.loads(read(path))
+    except json.JSONDecodeError as exc:
+        if errors is not None:
+            errors.append(f"{path}: invalid JSON ({exc.msg} at line {exc.lineno})")
+        return None
+
+
+# ---------------------------------------------------------------- frontmatter
+
+def _scalar(value: str):
+    value = value.strip()
+    if value in ("", "~", "null"):
+        return None
+    if value.lower() in ("true", "yes"):
+        return True
+    if value.lower() in ("false", "no"):
+        return False
+    if value.startswith("[") and value.endswith("]"):
+        return [_scalar(v) for v in value[1:-1].split(",") if v.strip()]
+    if len(value) >= 2 and value[0] == value[-1] and value[0] in "\"'":
+        return value[1:-1]
+    return value
+
+
+def parse_frontmatter(text: str):
+    """Return (dict, body, error). Handles the YAML subset used by Claude Code files."""
+    if not text.startswith("---"):
+        return {}, text, None
+    lines = text.splitlines()
+    end = next((i for i in range(1, len(lines)) if lines[i].strip() == "---"), None)
+    if end is None:
+        return {}, text, "frontmatter opened with --- but never closed"
+    data: dict = {}
+    key = None
+    block: list[str] = []
+    mode = None  # "list" | "text" | "map"
+
+    def flush():
+        nonlocal key, block, mode
+        if key is None:
+            return
+        if mode == "list":
+            data[key] = [_scalar(b.strip()[1:].strip()) for b in block if b.strip().startswith("-")]
+        elif mode in ("text", "map"):
+            data[key] = "\n".join(b.strip() for b in block).strip() if mode == "text" else "\n".join(block)
+        key, block, mode = None, [], None
+
+    for raw in lines[1:end]:
+        if not raw.strip() or raw.lstrip().startswith("#"):
+            if mode == "text":
+                block.append("")
+            continue
+        indented = raw[:1] in (" ", "\t")
+        if indented and key is not None:
+            if mode is None:
+                mode = "list" if raw.strip().startswith("-") else "map"
+            block.append(raw)
+            continue
+        if raw.strip().startswith("-") and key is not None:
+            mode = mode or "list"
+            block.append(raw)
+            continue
+        flush()
+        m = re.match(r"^([A-Za-z0-9_.-]+)\s*:\s*(.*)$", raw)
+        if not m:
+            return data, "\n".join(lines[end + 1:]), f"unparseable frontmatter line: {raw.strip()[:60]}"
+        k, v = m.group(1), m.group(2)
+        if v.strip() in ("|", ">", "|-", ">-", "|+", ">+"):
+            key, mode = k, "text"
+        elif v.strip() == "":
+            key = k
+        else:
+            data[k] = _scalar(v)
+    flush()
+    return data, "\n".join(lines[end + 1:]), None
+
+
+# ---------------------------------------------------------------- discovery
+
+def settings_layers(project: Path, errors: list | None = None):
+    layers = []
+    for scope, path in (
+        ("user", CLAUDE_HOME / "settings.json"),
+        ("project", project / ".claude" / "settings.json"),
+        ("local", project / ".claude" / "settings.local.json"),
+        ("managed", MANAGED_DIR / "managed-settings.json"),
+    ):
+        data = load_json(path, errors)
+        if isinstance(data, dict):
+            layers.append((scope, path, data))
+    return layers
+
+
+def merged_settings(layers):
+    merged: dict = {"env": {}, "enabledPlugins": {}, "permissions": {"allow": [], "ask": [], "deny": []}}
+    for _, _, data in layers:  # later layers win
+        for k, v in data.items():
+            if k in ("env", "enabledPlugins") and isinstance(v, dict):
+                merged[k].update(v)
+            elif k == "permissions" and isinstance(v, dict):
+                for sub in ("allow", "ask", "deny"):
+                    merged["permissions"][sub] += list(v.get(sub, []) or [])
+                for sub, val in v.items():
+                    if sub not in ("allow", "ask", "deny"):
+                        merged["permissions"][sub] = val
+            else:
+                merged[k] = v
+    return merged
+
+
+def git_root(project: Path) -> Path:
+    for d in [project, *project.parents]:
+        if (d / ".git").exists():
+            return d
+    return project
+
+
+def project_slugs(project: Path):
+    if os.environ.get("CLAUDE_CODE_PROJECT_DIR_NAME"):
+        return {os.environ["CLAUDE_CODE_PROJECT_DIR_NAME"]}
+    s = str(git_root(project))  # auto memory is keyed by git repo, so worktrees share it
+    return {re.sub(r"[^A-Za-z0-9]", "-", s), s.replace("/", "-").replace(".", "-"), s.replace("/", "-")}
+
+
+IMPORT_RE = re.compile(r"(?:^|\s)@((?:~|\.{1,2})?/?[\w./~-]+\.\w+)")
+
+
+def resolve_imports(path: Path, depth: int, seen: set, out: list, errors: list | None):
+    if depth > 4:  # docs: imports resolve up to four hops
+        return
+    in_fence = False
+    for line in read(path).splitlines():
+        if line.strip().startswith("```"):
+            in_fence = not in_fence
+            continue
+        if in_fence:
+            continue
+        for m in IMPORT_RE.finditer(re.sub(r"`[^`]*`", "", line)):
+            ref = m.group(1)
+            target = Path(os.path.expanduser(ref)) if ref.startswith("~") else (path.parent / ref)
+            target = target.resolve()
+            if target in seen:
+                continue
+            if target.is_file():
+                seen.add(target)
+                out.append(target)
+                resolve_imports(target, depth + 1, seen, out, errors)
+            elif errors is not None and "/" in ref:
+                errors.append(f"{path}: @import target not found: {ref}")
+
+
+def memory_entries(project: Path, settings: dict, errors: list | None = None):
+    """Return list of dicts: path, scope, when ('startup'|'on-demand'), tokens, lines."""
+    found: list[tuple[Path, str, str]] = []
+    found.append((MANAGED_DIR / "CLAUDE.md", "managed", "startup"))
+    found.append((CLAUDE_HOME / "CLAUDE.md", "user", "startup"))
+    for rule in sorted((CLAUDE_HOME / "rules").rglob("*.md")) if (CLAUDE_HOME / "rules").is_dir() else []:
+        fm, _, _ = parse_frontmatter(read(rule))
+        found.append((rule, "user-rule", "on-demand" if fm.get("paths") else "startup"))
+    chain = [project] + [p for p in project.parents if p != Path(p.anchor)]
+    for d in reversed(chain):
+        for name in ("CLAUDE.md", ".claude/CLAUDE.md", "CLAUDE.local.md"):
+            found.append((d / name, "project" if d == project else "ancestor", "startup"))
+    rules_dir = project / ".claude" / "rules"
+    if rules_dir.is_dir():
+        for rule in sorted(rules_dir.rglob("*.md")):
+            fm, _, err = parse_frontmatter(read(rule))
+            if err and errors is not None:
+                errors.append(f"{rule}: {err}")
+            found.append((rule, "rule", "on-demand" if fm.get("paths") else "startup"))
+    for sub in walk_named(project, "CLAUDE.md", max_depth=4):
+        if sub.parent != project and sub.parent.name != ".claude":
+            found.append((sub, "subdir", "on-demand"))
+
+    entries, seen = [], set()
+    for path, scope, when in found:
+        if not path.is_file() or path.resolve() in seen:
+            continue
+        seen.add(path.resolve())
+        text = read(path)
+        entries.append({"path": str(path), "scope": scope, "when": when,
+                        "tokens": est(text), "lines": text.count("\n") + 1})
+        imports: list[Path] = []
+        resolve_imports(path, 1, seen, imports, errors)
+        for imp in imports:
+            t = read(imp)
+            entries.append({"path": str(imp), "scope": f"import<-{path.name}", "when": when,
+                            "tokens": est(t), "lines": t.count("\n") + 1})
+
+    auto_enabled = settings.get("autoMemoryEnabled", True) is not False and not os.environ.get(
+        "CLAUDE_CODE_DISABLE_AUTO_MEMORY")
+    mem_dir = settings.get("autoMemoryDirectory")
+    candidates = [Path(os.path.expanduser(mem_dir))] if mem_dir else [
+        CLAUDE_HOME / "projects" / slug / "memory" for slug in project_slugs(project)]
+    for c in candidates:
+        mem = c / "MEMORY.md"
+        if auto_enabled and mem.is_file():
+            text = read(mem)
+            loaded = "\n".join(text.splitlines()[:200])[:25_000]
+            entries.append({"path": str(mem), "scope": "auto-memory", "when": "startup",
+                            "tokens": est(loaded), "lines": text.count("\n") + 1})
+            break
+    return entries, auto_enabled
+
+
+def walk_named(root: Path, filename: str, max_depth: int):
+    root_depth = len(root.parts)
+    for dirpath, dirnames, filenames in os.walk(root):
+        dirnames[:] = [d for d in dirnames if d not in SKIP_DIRS and not d.startswith(".")]
+        if len(Path(dirpath).parts) - root_depth >= max_depth:
+            dirnames[:] = []
+        if filename in filenames:
+            yield Path(dirpath) / filename
+
+
+def component_paths(base: Path, manifest: dict | None, key: str, default: str):
+    paths = [base / default]
+    if manifest and manifest.get(key):
+        val = manifest[key]
+        extra = [val] if isinstance(val, str) else [v for v in val if isinstance(v, str)] if isinstance(val, list) else []
+        resolved = [(base / v).resolve() for v in extra]
+        paths = paths + resolved if key == "skills" else resolved
+    return paths
+
+
+def scan_skills(dirs, source: str):
+    out = []
+    for d in dirs:
+        if d.is_file() and d.name == "SKILL.md":
+            files = [d]
+        elif d.is_dir():
+            files = sorted(d.glob("*/SKILL.md")) + ([d / "SKILL.md"] if (d / "SKILL.md").is_file() else [])
+        else:
+            continue
+        for f in files:
+            text = read(f)
+            fm, body, err = parse_frontmatter(text)
+            desc = str(fm.get("description") or "")
+            if fm.get("when_to_use"):
+                desc += " " + str(fm["when_to_use"])
+            if not desc:
+                desc = next((ln.strip() for ln in body.splitlines() if ln.strip() and not ln.startswith("#")), "")
+            name = str(fm.get("name") or f.parent.name)
+            listed = fm.get("disable-model-invocation") is not True
+            out.append({"kind": "skill", "name": name, "source": source, "path": str(f),
+                        "desc_chars": len(desc), "listed": listed,
+                        "tokens": est(name + ": " + desc[:SKILL_DESC_CAP]) if listed else 0,
+                        "lines": text.count("\n") + 1, "fm": fm, "error": err})
+    return out
+
+
+def scan_commands(dirs, source: str):
+    out = []
+    for d in dirs:
+        if not d.is_dir():
+            continue
+        for f in sorted(d.rglob("*.md")):
+            text = read(f)
+            fm, body, err = parse_frontmatter(text)
+            desc = str(fm.get("description") or next(
+                (ln.strip() for ln in body.splitlines() if ln.strip()), ""))
+            listed = fm.get("disable-model-invocation") is not True
+            name = f.relative_to(d).with_suffix("").as_posix().replace("/", ":")
+            out.append({"kind": "command", "name": name, "source": source, "path": str(f),
+                        "desc_chars": len(desc), "listed": listed,
+                        "tokens": est(name + ": " + desc[:SKILL_DESC_CAP]) if listed else 0,
+                        "lines": text.count("\n") + 1, "fm": fm, "error": err})
+    return out
+
+
+def scan_agents(dirs, source: str):
+    out = []
+    for d in dirs:
+        files = [d] if d.is_file() else sorted(d.rglob("*.md")) if d.is_dir() else []
+        for f in files:
+            text = read(f)
+            fm, body, err = parse_frontmatter(text)
+            desc = str(fm.get("description") or "")
+            name = str(fm.get("name") or f.stem)
+            out.append({"kind": "agent", "name": name, "source": source, "path": str(f),
+                        "desc_chars": len(desc), "listed": True, "tokens": est(name + ": " + desc),
+                        "body_tokens": est(body), "lines": text.count("\n") + 1, "fm": fm,
+                        "error": err, "has_examples": "<example>" in desc})
+    return out
+
+
+def enabled_plugins(project: Path, settings: dict):
+    installed = load_json(CLAUDE_HOME / "plugins" / "installed_plugins.json") or {}
+    registry = installed.get("plugins", {}) if isinstance(installed, dict) else {}
+    out = []
+    for key, on in (settings.get("enabledPlugins") or {}).items():
+        if not on:
+            continue
+        entries = registry.get(key) or []
+        pick = None
+        for e in entries:
+            pp = e.get("projectPath")
+            if pp and Path(pp).resolve() == project:
+                pick = e
+                break
+            if not pp and pick is None:
+                pick = e
+        pick = pick or (entries[0] if entries else None)
+        out.append({"id": key, "path": Path(pick["installPath"]) if pick and pick.get("installPath") else None})
+    return out
+
+
+def collect(project: Path, errors: list | None = None):
+    layers = settings_layers(project, errors)
+    settings = merged_settings(layers)
+    memory, auto_mem = memory_entries(project, settings, errors)
+
+    skills = scan_skills([CLAUDE_HOME / "skills"], "user") + scan_skills([project / ".claude" / "skills"], "project")
+    commands = scan_commands([CLAUDE_HOME / "commands"], "user") + scan_commands([project / ".claude" / "commands"], "project")
+    agents = scan_agents([CLAUDE_HOME / "agents"], "user") + scan_agents([project / ".claude" / "agents"], "project")
+
+    mcp = []
+    proj_mcp = load_json(project / ".mcp.json", errors) or {}
+    for n in (proj_mcp.get("mcpServers") or {}):
+        mcp.append({"name": n, "scope": "project (.mcp.json)"})
+    global_cfg = load_json(Path(os.environ["CLAUDE_CONFIG_DIR"]) / ".claude.json" if os.environ.get("CLAUDE_CONFIG_DIR")
+                           else HOME / ".claude.json") or {}
+    for n in (global_cfg.get("mcpServers") or {}):
+        mcp.append({"name": n, "scope": "user (~/.claude.json)"})
+    proj_entry = (global_cfg.get("projects") or {}).get(str(project)) or {}
+    for n in (proj_entry.get("mcpServers") or {}):
+        mcp.append({"name": n, "scope": "local (~/.claude.json)"})
+
+    hooks = []
+    for scope, path, data in layers:
+        for event, groups in (data.get("hooks") or {}).items():
+            for g in groups if isinstance(groups, list) else []:
+                for h in (g.get("hooks") or []) if isinstance(g, dict) else []:
+                    hooks.append({"scope": scope, "file": str(path), "event": event,
+                                  "matcher": g.get("matcher"), "hook": h})
+
+    plugins = []
+    for p in enabled_plugins(project, settings):
+        info = {"id": p["id"], "path": str(p["path"]) if p["path"] else None, "installed": bool(p["path"] and p["path"].is_dir())}
+        if info["installed"]:
+            base = p["path"]
+            manifest = load_json(base / ".claude-plugin" / "plugin.json") or {}
+            src = f"plugin:{p['id']}"
+            skills += scan_skills(component_paths(base, manifest, "skills", "skills"), src)
+            commands += scan_commands(component_paths(base, manifest, "commands", "commands"), src)
+            agents += scan_agents(component_paths(base, manifest, "agents", "agents"), src)
+            pm = load_json(base / ".mcp.json") or {}
+            servers = pm.get("mcpServers", pm) if isinstance(pm, dict) else {}
+            if isinstance(manifest.get("mcpServers"), dict):
+                servers = {**servers, **manifest["mcpServers"]}
+            for n in servers or {}:
+                mcp.append({"name": n, "scope": src})
+            ph = load_json(base / "hooks" / "hooks.json") or {}
+            for event, groups in (ph.get("hooks") or {}).items():
+                for g in groups if isinstance(groups, list) else []:
+                    for h in (g.get("hooks") or []) if isinstance(g, dict) else []:
+                        hooks.append({"scope": src, "file": str(base / "hooks" / "hooks.json"),
+                                      "event": event, "matcher": g.get("matcher"), "hook": h})
+        plugins.append(info)
+
+    return {"project": str(project), "layers": [(s, str(p)) for s, p, _ in layers], "settings": settings,
+            "memory": memory, "auto_memory_enabled": auto_mem, "skills": skills, "commands": commands,
+            "agents": agents, "mcp": mcp, "hooks": hooks, "plugins": plugins}
+
+
+# ---------------------------------------------------------------- audit
+
+def audit(project: Path, as_json: bool):
+    c = collect(project)
+    s = c["settings"]
+    env = {**{k: v for k, v in os.environ.items() if k in TOKEN_ENV_VARS}, **(s.get("env") or {})}
+    findings: list[tuple[str, str]] = []  # (severity, message)
+
+    mem_start = [m for m in c["memory"] if m["when"] == "startup"]
+    mem_tokens = sum(m["tokens"] for m in mem_start)
+    if mem_tokens > MEMORY_STARTUP_WARN:
+        findings.append(("high", f"Startup memory is ~{mem_tokens} tokens (> {MEMORY_STARTUP_WARN}). Move "
+                                 "task-specific sections into path-scoped .claude/rules/ or skills."))
+    for m in mem_start:
+        if m["lines"] > MEMORY_FILE_LINES_WARN and m["scope"] != "auto-memory":
+            findings.append(("medium", f"{m['path']} has {m['lines']} lines (> {MEMORY_FILE_LINES_WARN}); "
+                                       "trim or split it."))
+
+    listing = [x for x in c["skills"] + c["commands"] if x["listed"]]
+    listing_tokens = sum(x["tokens"] for x in listing)
+    agent_tokens = sum(a["tokens"] for a in c["agents"])
+    if listing_tokens + agent_tokens > LISTING_WARN:
+        findings.append(("medium", f"Skill/command/agent descriptions cost ~{listing_tokens + agent_tokens} tokens "
+                                   "every session. Disable unused plugins or set disable-model-invocation: true "
+                                   "on user-only skills."))
+    for x in listing:
+        if x["desc_chars"] > SKILL_DESC_CHARS_WARN:
+            findings.append(("low", f"{x['kind']} '{x['name']}' ({x['source']}) description is {x['desc_chars']} "
+                                    f"chars; aim for < {SKILL_DESC_CHARS_WARN}."))
+    for a in c["agents"]:
+        if a["has_examples"] or a["desc_chars"] > AGENT_DESC_CHARS_WARN:
+            findings.append(("low", f"agent '{a['name']}' ({a['source']}) description is {a['desc_chars']} chars"
+                                    f"{' with <example> blocks' if a['has_examples'] else ''}; it loads every "
+                                    "session. Keep it to 1-3 sentences."))
+    for x in c["skills"]:
+        if x["lines"] > SKILL_LINES_WARN and not x["source"].startswith("plugin:"):
+            findings.append(("low", f"skill '{x['name']}' SKILL.md is {x['lines']} lines; move detail to "
+                                    "supporting files (progressive disclosure)."))
+
+    if len(c["mcp"]) > MCP_SERVERS_WARN:
+        findings.append(("medium", f"{len(c['mcp'])} MCP servers configured. Scope rarely-used ones to "
+                                   "local/user or disable per project."))
+    if str(env.get("ENABLE_TOOL_SEARCH", "")).lower() in ("false", "0") and c["mcp"]:
+        findings.append(("high", "ENABLE_TOOL_SEARCH is off, so every MCP tool schema loads upfront."))
+
+    per_prompt = [h for h in c["hooks"] if h["event"] in ("UserPromptSubmit", "SessionStart")]
+    if per_prompt:
+        findings.append(("info", f"{len(per_prompt)} SessionStart/UserPromptSubmit hook(s): any stdout they print "
+                                 "is added to context. Keep their output short."))
+    broad = [h for h in c["hooks"] if h["event"] in ("PreToolUse", "PostToolUse") and h["matcher"] in (None, "", "*")]
+    if broad:
+        findings.append(("low", f"{len(broad)} Pre/PostToolUse hook(s) with no matcher run on every tool call."))
+
+    if s.get("autoCompactEnabled", True) is False or env.get("DISABLE_AUTO_COMPACT") or env.get("DISABLE_COMPACT"):
+        findings.append(("medium", "Auto-compact is disabled; long sessions will hit the context limit."))
+    if not c["auto_memory_enabled"]:
+        findings.append(("info", "Auto memory is disabled."))
+
+    deny = s["permissions"].get("deny", [])
+    if not any(".env" in str(r) for r in deny):
+        findings.append(("low", "No deny rule for .env/secrets (e.g. \"Read(./.env)\", \"Read(./.env.*)\")."))
+    for scope, path in c["layers"]:
+        if scope == "project":
+            proj = load_json(Path(path)) or {}
+            if (proj.get("permissions") or {}).get("defaultMode") == "bypassPermissions":
+                findings.append(("medium", "Project settings set defaultMode=bypassPermissions; Claude Code ignores "
+                                           "auto/bypassPermissions from project files, so remove it."))
+    if "1m" in str(s.get("model", "")).lower():
+        findings.append(("info", f"Model '{s.get('model')}' uses the 1M context window: cheaper per task only if "
+                                 "you compact or /clear between tasks."))
+    missing_plugins = [p["id"] for p in c["plugins"] if not p["installed"]]
+    if missing_plugins:
+        findings.append(("info", f"Enabled but not installed here: {', '.join(missing_plugins)}"))
+
+    summary = {
+        "memory_startup_tokens": mem_tokens,
+        "memory_on_demand_tokens": sum(m["tokens"] for m in c["memory"] if m["when"] == "on-demand"),
+        "skill_command_listing_tokens": listing_tokens,
+        "agent_listing_tokens": agent_tokens,
+        "mcp_servers": len(c["mcp"]),
+        "hooks": len(c["hooks"]),
+        "enabled_plugins": len(c["plugins"]),
+        "estimated_fixed_overhead_tokens": mem_tokens + listing_tokens + agent_tokens,
+    }
+    if as_json:
+        slim = {k: v for k, v in c.items() if k not in ("skills", "commands", "agents", "hooks")}
+        slim["skills"] = [{k: x[k] for k in ("kind", "name", "source", "tokens", "listed", "desc_chars")}
+                          for x in c["skills"] + c["commands"]]
+        slim["agents"] = [{k: a[k] for k in ("name", "source", "tokens", "desc_chars")} for a in c["agents"]]
+        slim["hooks"] = [{k: h[k] for k in ("scope", "event", "matcher")} for h in c["hooks"]]
+        print(json.dumps({"summary": summary, "findings": findings, "env": env, "detail": slim}, indent=2, default=str))
+        return 0
+
+    out = [f"# Claude Code config audit: {project}", "",
+           "Estimates use chars/4. Run /context in a session for exact numbers.", "",
+           "## Fixed overhead (loaded every session)", "",
+           "| Layer | ~Tokens | Items |", "|---|---:|---:|",
+           f"| Memory (CLAUDE.md, rules, auto memory) | {mem_tokens} | {len(mem_start)} |",
+           f"| Skill + command descriptions | {listing_tokens} | {len(listing)} |",
+           f"| Agent descriptions | {agent_tokens} | {len(c['agents'])} |",
+           f"| **Total** | **{summary['estimated_fixed_overhead_tokens']}** | |",
+           "", f"On-demand memory (path rules, subdir CLAUDE.md): ~{summary['memory_on_demand_tokens']} tokens.",
+           f"MCP servers: {len(c['mcp'])} | Hooks: {len(c['hooks'])} | Enabled plugins: {len(c['plugins'])}", ""]
+    if mem_start:
+        out += ["## Memory files", "", "| File | Scope | When | ~Tokens | Lines |", "|---|---|---|---:|---:|"]
+        for m in sorted(c["memory"], key=lambda m: -m["tokens"]):
+            out.append(f"| {shorten(m['path'], project)} | {m['scope']} | {m['when']} | {m['tokens']} | {m['lines']} |")
+        out.append("")
+    by_source: dict[str, list[int]] = {}
+    for x in c["skills"] + c["commands"] + c["agents"]:
+        agg = by_source.setdefault(x["source"], [0, 0, 0])
+        agg[0] += x["tokens"]
+        agg[1] += 1
+        agg[2] += 0 if x["listed"] else 1
+    if by_source:
+        out += ["## Description cost by source", "", "| Source | ~Tokens | Items | User-only (free) |",
+                "|---|---:|---:|---:|"]
+        for src, (tok, n, hidden) in sorted(by_source.items(), key=lambda kv: -kv[1][0]):
+            out.append(f"| {src} | {tok} | {n} | {hidden} |")
+        out.append("")
+    if c["mcp"]:
+        out += ["## MCP servers", ""] + [f"- {m['name']} ({m['scope']})" for m in c["mcp"]] + [""]
+    out += ["## Token-related settings", "",
+            f"- model: {s.get('model', '(default)')} | effortLevel: {s.get('effortLevel', '(default)')}",
+            f"- autoCompactEnabled: {s.get('autoCompactEnabled', True)} | autoCompactWindow: "
+            f"{s.get('autoCompactWindow', '(model default)')}",
+            f"- auto memory: {'on' if c['auto_memory_enabled'] else 'off'}",
+            f"- outputStyle: {s.get('outputStyle', '(default)')}"]
+    out += [f"- {k}={v}" for k, v in sorted(env.items()) if k in TOKEN_ENV_VARS] or ["- (no token env vars set)"]
+    out += ["", "## Findings", ""]
+    order = {"high": 0, "medium": 1, "low": 2, "info": 3}
+    out += [f"- [{sev}] {msg}" for sev, msg in sorted(findings, key=lambda f: order[f[0]])] or ["- None."]
+    print("\n".join(out))
+    return 0
+
+
+def shorten(path: str, project: Path) -> str:
+    p = Path(path)
+    try:
+        return "./" + p.relative_to(project).as_posix()
+    except ValueError:
+        return str(p).replace(str(HOME), "~", 1)
+
+
+# ---------------------------------------------------------------- validate
+
+NAME_RE = re.compile(r"^[a-z0-9][a-z0-9-]{0,63}$")
+PERM_RE = re.compile(r"^[A-Za-z_*][\w:.*-]*(\(.*\))?$")
+
+
+def validate(project: Path, as_json: bool):
+    errors: list[str] = []
+    warnings: list[str] = []
+    c = collect(project, errors)
+
+    for scope, path in c["layers"]:
+        data = load_json(Path(path)) or {}
+        perms = data.get("permissions") or {}
+        for bucket in ("allow", "ask", "deny"):
+            for rule in perms.get(bucket, []) or []:
+                if not isinstance(rule, str) or not PERM_RE.match(rule) or rule.count("(") != rule.count(")"):
+                    errors.append(f"{path}: malformed permission rule in {bucket}: {rule!r}")
+                elif rule.startswith("mcp__") and "(" in rule:
+                    warnings.append(f"{path}: {rule!r} is skipped by Claude Code (mcp__ rules can't take parentheses)")
+                elif bucket == "allow" and rule in ("Bash", "Bash(*)") and scope in ("project", "local"):
+                    warnings.append(f"{path}: allow rule {rule!r} lets Claude run any shell command without asking")
+        mode = perms.get("defaultMode")
+        if mode and mode not in ("default", "acceptEdits", "plan", "auto", "dontAsk", "bypassPermissions", "manual"):
+            warnings.append(f"{path}: unknown permissions.defaultMode {mode!r}")
+        if "$schema" not in data and scope in ("project", "local"):
+            warnings.append(f"{path}: add \"$schema\": \"https://json.schemastore.org/claude-code-settings.json\" "
+                            "for editor validation")
+
+    for h in c["hooks"]:
+        where = f"{h['file']} [{h['event']}]"
+        if h["event"] not in HOOK_EVENTS:
+            warnings.append(f"{where}: unknown hook event (typo, or newer than this checker)")
+        hook = h["hook"] if isinstance(h["hook"], dict) else {}
+        htype = hook.get("type")
+        if htype not in HOOK_TYPES:
+            errors.append(f"{where}: hook type {htype!r} is not one of {sorted(HOOK_TYPES)}")
+        if htype == "command":
+            cmd = hook.get("command") or ""
+            if not cmd:
+                errors.append(f"{where}: command hook without 'command'")
+            m = re.search(r"\$\{?CLAUDE_PROJECT_DIR\}?/([^\s\"']+)", cmd)
+            if m and not h["scope"].startswith("plugin:"):
+                script = project / m.group(1)
+                if not script.exists():
+                    errors.append(f"{where}: hook script not found: {script}")
+                elif not os.access(script, os.X_OK) and not re.match(r"^\s*(bash|sh|python3?|node|uv)\b", cmd):
+                    warnings.append(f"{where}: hook script not executable: {script} (chmod +x)")
+        if htype in ("prompt", "agent") and not hook.get("prompt"):
+            errors.append(f"{where}: {htype} hook without 'prompt'")
+
+    for a in c["agents"]:
+        if a["source"].startswith("plugin:"):
+            continue
+        fm, where = a["fm"], a["path"]
+        if a["error"]:
+            errors.append(f"{where}: {a['error']}")
+        if not fm.get("name"):
+            errors.append(f"{where}: agent missing 'name'")
+        elif ":" in str(fm["name"]) or not NAME_RE.match(str(fm["name"])):
+            warnings.append(f"{where}: agent name should be lowercase letters, digits, hyphens")
+        if not fm.get("description"):
+            errors.append(f"{where}: agent missing 'description' (needed for delegation)")
+        model = fm.get("model")
+        if model and str(model) not in MODEL_ALIASES and not str(model).startswith("claude-"):
+            warnings.append(f"{where}: unrecognized model {model!r}")
+        if fm.get("color") and fm["color"] not in AGENT_COLORS:
+            warnings.append(f"{where}: color {fm['color']!r} not in {sorted(AGENT_COLORS)}")
+        if fm.get("effort") and fm["effort"] not in EFFORT_LEVELS:
+            warnings.append(f"{where}: effort {fm['effort']!r} not in {sorted(EFFORT_LEVELS)}")
+
+    for x in c["skills"] + c["commands"]:
+        if x["source"].startswith("plugin:"):
+            continue
+        fm, where = x["fm"], x["path"]
+        if x["error"]:
+            errors.append(f"{where}: {x['error']}")
+        if x["kind"] == "skill":
+            name = str(fm.get("name") or Path(where).parent.name)
+            if not NAME_RE.match(name):
+                warnings.append(f"{where}: skill name {name!r} should be lowercase, digits, hyphens (max 64)")
+            if not fm.get("description"):
+                warnings.append(f"{where}: no description; Claude cannot tell when to use it")
+            base = Path(where).parent
+            for link in re.findall(r"\]\((?!https?:|#|mailto:)([^)\s]+)\)", read(Path(where))):
+                if "$" not in link and not (base / link).exists():
+                    errors.append(f"{where}: linked file not found: {link}")
+        if x["desc_chars"] > SKILL_DESC_CAP:
+            warnings.append(f"{where}: description is {x['desc_chars']} chars; listing truncates at {SKILL_DESC_CAP}")
+        if fm.get("context") and fm["context"] != "fork":
+            errors.append(f"{where}: context must be 'fork' when set")
+        if fm.get("effort") and fm["effort"] not in EFFORT_LEVELS:
+            warnings.append(f"{where}: effort {fm['effort']!r} not in {sorted(EFFORT_LEVELS)}")
+
+    mcp_file = project / ".mcp.json"
+    data = load_json(mcp_file) or {}
+    for name, cfg in (data.get("mcpServers") or {}).items():
+        if not isinstance(cfg, dict):
+            errors.append(f"{mcp_file}: server {name!r} must be an object")
+            continue
+        if not cfg.get("command") and not cfg.get("url"):
+            errors.append(f"{mcp_file}: server {name!r} needs 'command' (stdio) or 'url' (http/sse)")
+        for k, v in (cfg.get("env") or {}).items():
+            if isinstance(v, str) and len(v) > 20 and not v.startswith("${") and re.search(r"(key|token|secret)", k, re.I):
+                warnings.append(f"{mcp_file}: {name}.env.{k} looks like a literal secret; use ${{{k}}} expansion")
+
+    if as_json:
+        print(json.dumps({"errors": errors, "warnings": warnings}, indent=2))
+    else:
+        print(f"# Validate: {project}\n")
+        print(f"Errors: {len(errors)}  Warnings: {len(warnings)}\n")
+        for e in errors:
+            print(f"- ERROR {e}")
+        for w in warnings:
+            print(f"- warn  {w}")
+        if not errors and not warnings:
+            print("- All checked files look valid.")
+    return 1 if errors else 0
+
+
+def list_assets():
+    refs = sorted(p.stem for p in (KNOWLEDGE / "references").glob("*.md"))
+    hooks = sorted(p.stem for p in (KNOWLEDGE / "templates" / "hooks").glob("*.sh"))
+    print("references: " + ", ".join(refs) + "  (aliases: " + ", ".join(sorted(REF_ALIASES)) + ")")
+    print("templates:  " + ", ".join(sorted(TEMPLATE_ALIASES)) + ", " + ", ".join(f"hook:{h}" for h in hooks))
+    return 0
+
+
+def show_ref(topic: str):
+    name = REF_ALIASES.get(topic, topic).removesuffix(".md")
+    path = KNOWLEDGE / "references" / f"{name}.md"
+    if not path.is_file():
+        print(f"unknown reference {topic!r}", file=sys.stderr)
+        list_assets()
+        return 2
+    sys.stdout.write(read(path))
+    return 0
+
+
+def template(name: str, dest: str | None):
+    if name.startswith("hook:"):
+        path = KNOWLEDGE / "templates" / "hooks" / f"{name[5:].removesuffix('.sh')}.sh"
+    else:
+        path = KNOWLEDGE / "templates" / TEMPLATE_ALIASES.get(name, name)
+    if not path.is_file():
+        print(f"unknown template {name!r}", file=sys.stderr)
+        list_assets()
+        return 2
+    if not dest:
+        sys.stdout.write(read(path))
+        return 0
+    target = Path(dest).expanduser()
+    if target.exists():
+        print(f"refusing to overwrite existing {target}; edit it instead", file=sys.stderr)
+        return 1
+    target.parent.mkdir(parents=True, exist_ok=True)
+    shutil.copy2(path, target)
+    print(f"copied {path.name} -> {target}")
+    return 0
+
+
+def main(argv=None):
+    ap = argparse.ArgumentParser(prog="cc-config", description="Claude Code config helper (cc-config plugin)")
+    sub = ap.add_subparsers(dest="command", required=True)
+    for name in ("audit", "validate"):
+        sp = sub.add_parser(name)
+        sp.add_argument("--project", default=os.environ.get("CLAUDE_PROJECT_DIR") or os.getcwd())
+        sp.add_argument("--json", action="store_true", help="machine-readable output")
+    sp = sub.add_parser("ref")
+    sp.add_argument("topic")
+    sp = sub.add_parser("template")
+    sp.add_argument("name")
+    sp.add_argument("--to", dest="dest")
+    sub.add_parser("list")
+    args = ap.parse_args(argv)
+    if args.command == "list":
+        return list_assets()
+    if args.command == "ref":
+        return show_ref(args.topic)
+    if args.command == "template":
+        return template(args.name, args.dest)
+    project = Path(args.project).expanduser().resolve()
+    if not project.is_dir():
+        print(f"not a directory: {project}", file=sys.stderr)
+        return 2
+    return audit(project, args.json) if args.command == "audit" else validate(project, args.json)
+
+
+if __name__ == "__main__":
+    sys.exit(main())
