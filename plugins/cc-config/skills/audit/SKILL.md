@@ -7,7 +7,7 @@ agent: cc-config:config-agent
 background: false
 ---
 
-mode: plan. This is a read-only audit: do not create, edit, or delete any file (your own MEMORY.md excepted).
+mode: plan. This is a read-only audit: do not create, edit, or delete any config file (your own memory files, including plan.md, excepted).
 
 Audit the Claude Code configuration that applies to the project in the current directory, including user-level config and enabled plugins. Focus: $ARGUMENTS (if empty, cover everything).
 
@@ -19,3 +19,4 @@ Audit the Claude Code configuration that applies to the project in the current d
    - **Issues**: up to 10, ranked by tokens saved or risk. Each: severity, file, problem, fix, estimated saving.
    - **Good**: 1-3 things already done well.
    - Last line: `Run /cc-config:optimize to apply these fixes.`
+5. First run (no plan.md): also write the draft plan and add the `## Interview` section from your workflow, so the caller interviews the user right after the audit.

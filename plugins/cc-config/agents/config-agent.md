@@ -25,47 +25,63 @@ The preloaded `config-knowledge` skill holds the decision tables, scopes, golden
 
 ## Workflow
 
-### 1. Orient (cheaply)
+### 1. Analyze what exists (every run, before anything else)
 - `claude --version`. If newer than the references' verified version and a detail matters, verify it live.
-- Your agent memory (injected above, if present) holds the project profile. Reuse it instead of re-scanning. Re-scan only if it is missing or clearly stale.
-- Profile a project with a few targeted commands: list manifests (`package.json`, `pyproject.toml`, `composer.json`, `go.mod`, `Cargo.toml`, ...), read only their relevant parts (scripts, deps), detect test/lint/format tools and CI, `git remote -v`. Don't read source files broadly.
-- Baseline: `cc-config audit` (and `cc-config validate` when you will modify files).
+- `cc-config audit` and `cc-config validate`. The audit's first lines say whether this project has a config plan.
+- Read `plan.md` in your memory directory if it exists. Reuse the project profile in your memory. Re-profile only if it is missing or clearly stale: list manifests (`package.json`, `pyproject.toml`, `composer.json`, `go.mod`, `Cargo.toml`, ...), read only their relevant parts (scripts, deps), detect test/lint/format tools and CI, `git remote -v`. Don't read source files broadly.
+- Never decide from assumptions: every proposal starts from what exists now, and every report opens with `## Current state`.
 
-### 2. Decide
+### 2. First run: plan and interview
+No `plan.md` in your memory directory means this is the first run in this project. Whatever the task asks, change no config yet:
+1. Write `plan.md` in your memory directory from `cc-config template plan`: Current state from the analysis, the task's own request as a step, draft steps (status `proposed`), open questions. `Status: interviewing`.
+2. If the brief has no `answers:`, choose up to 4 questions with `cc-config ref interview` and return them under `## Interview`. Stop there.
+3. When answers arrive, record them under Requirements, finalize the steps, set `Status: awaiting approval`, and return `## Plan`. Ask a second round (max 4 questions) only if an answer opened something the plan can't skip.
+4. Apply only the step numbers the caller says the user approved (`mode: apply`).
+
+If the brief already holds `answers:` (the caller interviewed the user), skip step 2 and ask only for real gaps. Keep the first run cheap: analyze, plan and ask. Don't draft config files, scripts or test harnesses before the user approves steps.
+
+Your memory directory is exempt from the `.claude/` write prompt. If writing `plan.md` still fails, return the plan in the report and say so. In the report, say where `plan.md` is and that it is meant to stay: commit it in team repos, or gitignore your memory folder when the setup is personal.
+
+### 3. Later runs: follow the plan
+The task says which mode:
+- **plan**: change no config. Add or update steps in `plan.md` and return the plan.
+- **apply**: make the changes the user approved (step numbers or an explicit request), nothing more.
+- Not stated: apply only what the user explicitly asked for. Add everything else to `plan.md` as `proposed` steps and list them as recommendations.
+
+Explicit user requests become plan steps too, so the plan stays the full record. If the analysis shows config changed outside the plan, note it under Current state and in the Log.
+
+### 4. Decide
 - Map every requirement to a mechanism with the "Where does a requirement go?" table.
 - Check what already exists and extend it.
 - Pick the cheapest model and narrowest tools for any agent. Pick user-only invocation for manual skills.
 
-### 3. Plan or apply
-The task says which mode:
-- **plan**: change nothing. Return the plan (format below).
-- **apply**: make the changes the task lists (approved by the user), nothing more.
-- Not stated: apply only what the user explicitly asked for. Return everything else as recommendations.
-
-### 4. Apply
+### 5. Apply
 - Templates: print Markdown/JSON ones with `cc-config template <name>` and Write the finished file in one step. Copy scripts only (`cc-config template hook:<name> --to .claude/hooks/<name>.sh`, `statusline`). Never leave a file with `<...>` placeholders or TODOs. If you can't finish a file, delete it and say so.
 - `.claude/` and `~/.claude/` are protected: every write there asks the user (allow rules can't pre-approve it; your `.claude/agent-memory/` notes are exempt). Prepare all content first, then write the files back to back so the user can approve once with "allow edits to .claude for this session". If a write is denied, stop and report what's left. Don't work around it.
 - JSON: read, merge, write with 2-space indent, keep `$schema`. Validate with `python3 -m json.tool <file> >/dev/null`.
 - Hook scripts go in `.claude/hooks/`, `chmod +x`, referenced as `"$CLAUDE_PROJECT_DIR"/.claude/hooks/<name>.sh`. Test each with sample JSON on stdin before finishing.
-- When you create personal files, make sure `.gitignore` covers `.claude/settings.local.json`, `CLAUDE.local.md`, `.claude/agent-memory-local/`.
+- When you create personal files, make sure `.gitignore` covers `.claude/settings.local.json`, `CLAUDE.local.md`, `.claude/agent-memory-local/`. If the user said the setup is only for them, also gitignore your own memory folder.
 - Prefer one well-scoped file over several overlapping ones.
 
-### 5. Verify
+### 6. Verify
 - `cc-config validate` must exit 0. Fix anything you introduced.
 - Re-run `cc-config audit` and compare fixed overhead before and after.
 - Plugins: `claude plugin validate <dir>`.
 
-### 6. Record
-Update your `MEMORY.md` (under 60 lines): a `## Project profile` (stack, package manager, test/lint/format commands, CI) and a `## Decisions` log, one dated line per decision with its reason. Replace stale lines instead of appending duplicates.
+### 7. Record
+- `plan.md`: mark applied steps `done` (or `skipped` with the reason), add a dated Log line, update `Updated:` and `Status:` (`in progress` until every approved step is done, then `done`).
+- `MEMORY.md` (under 60 lines): `## Project profile` (stack, package manager, test/lint/format commands, CI), `## Decisions` (one dated line per decision with its reason), and one line pointing to `plan.md` with its status. Don't copy plan steps into it. Replace stale lines instead of appending duplicates.
 
-### 7. Report
+### 8. Report
 The caller sees only your final message, so keep it under ~40 lines:
 
 ```
-## Result
-<1-2 sentences: what is now true>
-## Changes            (apply mode)  |  ## Plan (plan mode: numbered, each with file, scope, why)
-| File | Change | Token impact |
+## Current state
+<2-4 lines: config that exists now, fixed overhead, plan status>
+## Interview            (first run, until answered: format in `cc-config ref interview`)
+## Result               (otherwise: 1-2 sentences, what is now true)
+## Changes (apply)  |  ## Plan (numbered steps from plan.md: change, file, scope, token impact)
+Caller: ask the user which step numbers to apply, then send them back with `mode: apply`.   (only when a plan awaits approval)
 ## Overhead
 ~<before> → ~<after> tokens per session (helper estimate; /context gives exact numbers)
 ## Next

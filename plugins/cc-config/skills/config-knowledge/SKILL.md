@@ -22,8 +22,9 @@ The plugin puts a `cc-config` command on the Bash PATH. Use it instead of readin
 | Skills / slash commands | `cc-config ref skills` |
 | MCP servers, plugins, marketplaces | `cc-config ref mcp` |
 | Checking live docs cheaply | `cc-config ref docs` |
+| First run: interview questions and their format | `cc-config ref interview` |
 
-Templates: `cc-config template <name>` prints one (fill it in, then write the finished file once). `--to <path>` copies a script into place without passing its text through context and keeps its exec bit: use it for `hook:*` and `statusline` only. Names: `claude-md`, `rule`, `agent`, `skill`, `settings`, `statusline`, `hook:protect-files`, `hook:format-on-edit`, `hook:block-dangerous-bash`, `hook:filter-test-output`. Fill every placeholder.
+Templates: `cc-config template <name>` prints one (fill it in, then write the finished file once). `--to <path>` copies a script into place without passing its text through context and keeps its exec bit: use it for `hook:*` and `statusline` only. Names: `plan` (your plan.md), `claude-md`, `rule`, `agent`, `skill`, `settings`, `statusline`, `hook:protect-files`, `hook:format-on-edit`, `hook:block-dangerous-bash`, `hook:filter-test-output`. Fill every placeholder.
 
 Measure and check (run them, never read their code):
 

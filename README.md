@@ -50,7 +50,7 @@ Requirements: Claude Code 2.1.271 or later (older versions ignore some agent fie
 
 | Command | What it does |
 |---|---|
-| `/cc-config:setup [requirements]` | Asks a few questions, audits, proposes a plan, applies what you approve |
+| `/cc-config:setup [requirements]` | Analyzes what exists, interviews you, writes the plan, applies the steps you approve |
 | `/cc-config:audit [focus]` | Read-only report: tokens per session, top contributors, ranked fixes |
 | `/cc-config:optimize [target]` | Cuts config token cost (split CLAUDE.md into path rules/skills, shrink descriptions, prune plugins/MCP, tune compaction) |
 | `/cc-config:agent <description>` | Creates or improves a subagent (minimal tools, cheapest capable model) |
@@ -61,6 +61,19 @@ Requirements: Claude Code 2.1.271 or later (older versions ignore some agent fie
 | `/cc-config:mcp <service>` | Adds, scopes, or prunes MCP servers. Prefers a CLI when one exists |
 
 You can also just ask, for example "create an agent that reviews PRs for security issues" or "make auto-compact cheaper". Claude hands config work to `cc-config:config-agent` on its own.
+
+## How it works
+
+**Every run starts with an analysis.** Before proposing or changing anything, the agent measures the config that already exists (`cc-config audit` and `validate`), reads its plan for this project, and opens its report with the current state.
+
+**The first run in a project is an interview.** Whatever you asked for, the agent first:
+1. Analyzes the project and its current Claude Code config.
+2. Writes a config plan, `plan.md`, in its memory folder (`.claude/agent-memory/…config-agent/`).
+3. Picks up to 4 questions that the analysis couldn't answer: who uses the setup, cost priority, permissions, safety checks, then workflows, helper agents and integrations if needed. Claude asks you these in the chat, because subagents can't ask you directly.
+4. Turns your answers into numbered plan steps, each with its file, scope and token cost, and asks which steps to apply.
+5. Applies only the steps you approve and marks them done in the plan.
+
+**Later runs follow the plan.** New requests become plan steps, so the plan stays a full record of what was set up and why. Commit `.claude/agent-memory/` in team repos so everyone's agent shares the same plan.
 
 ## Token cost
 
@@ -79,7 +92,7 @@ How the agent keeps your config cheap:
 - Compaction is tuned to your model (`autoCompactWindow`), and hooks filter noisy output before it reaches context.
 - It reports before → after overhead for every change (`cc-config audit`).
 - It looks up docs by extracting only the needed section (`curl` + `sed`), never whole pages (a page can be ~30k tokens).
-- It keeps a project profile and decision log in `.claude/agent-memory/cc-config-config-agent/`, so it doesn't re-scan your repo every time.
+- It keeps a project profile, decision log and config plan in its memory folder (`.claude/agent-memory/`), so it doesn't re-scan your repo every time. Only the short MEMORY.md loads into the agent; it reads the plan when it runs.
 
 ## Permissions and what it touches
 
@@ -93,8 +106,8 @@ How the agent keeps your config cheap:
 ```bash
 cc-config audit    [--project DIR] [--json]   # token footprint of every always-loaded layer + findings
 cc-config validate [--project DIR] [--json]   # settings, permissions, hooks, agents, skills, .mcp.json
-cc-config ref <topic>                         # tokens | memory | settings | hooks | agents | skills | mcp | docs
-cc-config template <name> [--to PATH]         # claude-md | rule | agent | skill | settings | statusline | hook:<name>
+cc-config ref <topic>                         # tokens | memory | settings | hooks | agents | skills | mcp | docs | interview
+cc-config template <name> [--to PATH]         # plan | claude-md | rule | agent | skill | settings | statusline | hook:<name>
 cc-config list
 ```
 

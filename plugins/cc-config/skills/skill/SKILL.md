@@ -14,4 +14,5 @@ Requirements: $ARGUMENTS
    - For the team (`.claude/skills/`, committed) or just you (`~/.claude/skills/`)?
 2. Delegate to the `cc-config:config-agent` subagent and wait for its result:
    > mode: apply. Create a skill, or update the existing one if a skill with this purpose already exists. Requirements: <requirements + answers>. Follow `cc-config ref skills` and `cc-config template skill`: one job, description under 300 chars with concrete triggers, `disable-model-invocation: true` if user-triggered or side-effecting, `argument-hint` when it takes input, SKILL.md under 500 lines with long material in linked supporting files, deterministic steps as scripts in the skill folder, `context: fork` if its work is verbose. Validate, then report the path, how to invoke it, and its per-session token cost (0 if user-only).
-3. Relay the report, including the exact command to run it (`/<name> <args>`).
+3. **First run or plan approval.** If the report has `## Interview` or a plan awaiting approval, follow its `Caller:` line: ask with AskUserQuestion, then send the answers or the approved step numbers back (resume the same subagent if you can). Repeat until it reports changes.
+4. Relay the report, including the exact command to run it (`/<name> <args>`).

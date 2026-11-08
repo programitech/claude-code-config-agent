@@ -26,7 +26,9 @@ KNOWLEDGE = Path(__file__).resolve().parent.parent / "skills" / "config-knowledg
 REF_ALIASES = {"tokens": "token-efficiency", "cost": "token-efficiency", "agents": "subagents",
                "mcp": "mcp-plugins", "plugins": "mcp-plugins", "docs": "docs-index", "permissions": "settings"}
 TEMPLATE_ALIASES = {"claude-md": "CLAUDE.template.md", "rule": "rule.md", "agent": "agent.md",
-                    "skill": "skill.md", "settings": "settings.template.json", "statusline": "statusline.sh"}
+                    "skill": "skill.md", "settings": "settings.template.json", "statusline": "statusline.sh",
+                    "plan": "plan.md"}
+PLAN_STEP_STATES = ("proposed", "approved", "done", "skipped")
 CLAUDE_HOME = Path(os.environ.get("CLAUDE_CONFIG_DIR", HOME / ".claude"))
 MANAGED_DIR = (
     Path("/Library/Application Support/ClaudeCode")
@@ -452,8 +454,26 @@ def collect(project: Path, errors: list | None = None):
 
 # ---------------------------------------------------------------- audit
 
+def config_plan(project: Path):
+    """Find the config agent's plan.md (kept in its agent-memory folder) and summarize it."""
+    roots = dict.fromkeys([project, git_root(project)])
+    for root in roots:
+        for mem in (".claude/agent-memory", ".claude/agent-memory-local"):
+            for path in sorted((root / mem).glob("*config-agent*/plan.md")):
+                text = read(path)
+                status = re.search(r"^Status:\s*(.+)$", text, re.M)
+                steps = {s: 0 for s in PLAN_STEP_STATES}
+                for row in re.findall(r"^\|\s*\d+\s*\|.*\|\s*([a-z]+)\s*\|\s*$", text, re.M):
+                    if row in steps:
+                        steps[row] += 1
+                return {"path": str(path), "status": status.group(1).strip() if status else "unknown",
+                        "steps": steps}
+    return None
+
+
 def audit(project: Path, as_json: bool):
     c = collect(project)
+    plan = config_plan(project)
     s = c["settings"]
     env = {**{k: v for k, v in os.environ.items() if k in TOKEN_ENV_VARS}, **(s.get("env") or {})}
     findings: list[tuple[str, str]] = []  # (severity, message)
@@ -533,7 +553,15 @@ def audit(project: Path, as_json: bool):
         "hooks": len(c["hooks"]),
         "enabled_plugins": len(c["plugins"]),
         "estimated_fixed_overhead_tokens": mem_tokens + listing_tokens + agent_tokens,
+        "config_plan": plan,
+        "first_run": plan is None,
     }
+    if plan:
+        done, total = plan["steps"]["done"], sum(plan["steps"].values())
+        plan_line = (f"Config plan: {shorten(plan['path'], project)} (Status: {plan['status']}; "
+                     f"{done}/{total} steps done)")
+    else:
+        plan_line = "Config plan: none. First run: interview the user and write the plan before changing config."
     if as_json:
         slim = {k: v for k, v in c.items() if k not in ("skills", "commands", "agents", "hooks")}
         slim["skills"] = [{k: x[k] for k in ("kind", "name", "source", "tokens", "listed", "desc_chars")}
@@ -544,7 +572,7 @@ def audit(project: Path, as_json: bool):
         return 0
 
     out = [f"# Claude Code config audit: {project}", "",
-           "Estimates use chars/4. Run /context in a session for exact numbers.", "",
+           "Estimates use chars/4. Run /context in a session for exact numbers.", "", plan_line, "",
            "## Fixed overhead (loaded every session)", "",
            "| Layer | ~Tokens | Items |", "|---|---:|---:|",
            f"| Memory (CLAUDE.md, rules, auto memory) | {mem_tokens} | {len(mem_start)} |",

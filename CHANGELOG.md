@@ -1,5 +1,13 @@
 # Changelog
 
+## 1.1.0 (2026-11-08)
+
+- The agent analyzes the existing config at the start of every run (`cc-config audit` + `validate` + its plan) and opens every report with `## Current state`.
+- First run in a project: the agent writes a config plan (`plan.md` in its agent-memory folder) and returns interview questions. The main session asks them (subagents can't ask the user directly), then the agent finalizes the plan and applies only the steps you approve.
+- Later runs follow the plan: new requests become plan steps, applied steps are marked done with a dated log.
+- `cc-config audit` reports the plan's status, or that this is a first run. New `cc-config ref interview` and `cc-config template plan`.
+- `/cc-config:setup` now lets the agent pick the interview questions from its analysis instead of asking fixed ones up front. All slash commands pass interview answers and approvals back to the agent.
+
 ## 1.0.0 (2026-11-06)
 
 First release of the `cc-config` plugin.
